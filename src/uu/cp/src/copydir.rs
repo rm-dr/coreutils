@@ -27,7 +27,7 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::{
     aligned_ancestors, context_for, copy_attributes, copy_file, copy_link, CopyResult, Error,
-    Options,
+    Options, Preserve,
 };
 
 /// Ensure a Windows path starts with a `\\?`.
@@ -223,6 +223,7 @@ fn copy_direntry(
     preserve_hard_links: bool,
     copied_destinations: &HashSet<PathBuf>,
     copied_files: &mut HashMap<FileInformation, PathBuf>,
+    dirs_with_attrs_to_fix: &mut Vec<(PathBuf, PathBuf)>,
 ) -> CopyResult<()> {
     let Entry {
         source_absolute,
@@ -246,10 +247,14 @@ fn copy_direntry(
         if target_is_file {
             return Err("cannot overwrite non-directory with directory".into());
         } else {
-            build_dir(options, &local_to_target, false)?;
+            build_dir(&local_to_target, false, options, Some(&source_absolute))?;
             if options.verbose {
                 println!("{}", context_for(&source_relative, &local_to_target));
             }
+
+            // `build_dir` doesn't set fully set attributes,
+            // we'll need to fix them later.
+            dirs_with_attrs_to_fix.push((source_absolute, local_to_target));
             return Ok(());
         }
     }
@@ -371,7 +376,7 @@ pub(crate) fn copy_directory(
     let tmp = if options.parents {
         if let Some(parent) = root.parent() {
             let new_target = target.join(parent);
-            build_dir(options, &new_target, true)?;
+            build_dir(&new_target, true, options, None)?;
             if options.verbose {
                 // For example, if copying file `a/b/c` and its parents
                 // to directory `d/`, then print
@@ -403,6 +408,16 @@ pub(crate) fn copy_directory(
         Err(e) => return Err(format!("failed to get current directory {e}").into()),
     };
 
+    // We omit certain permissions when creating dirs
+    // to prevent other uses from accessing them before they're done
+    // (race condition).
+    //
+    // As such, we need to go back through the dirs we copied and
+    // fix these permissions.
+    //
+    // This is a vec of (old_path, new_path)
+    let mut dirs_with_attrs_to_fix: Vec<(PathBuf, PathBuf)> = Vec::new();
+
     // Traverse the contents of the directory, copying each one.
     for direntry_result in WalkDir::new(root)
         .same_file_system(options.one_file_system)
@@ -419,6 +434,7 @@ pub(crate) fn copy_directory(
                     preserve_hard_links,
                     copied_destinations,
                     copied_files,
+                    &mut dirs_with_attrs_to_fix,
                 )?;
             }
             // Print an error message, but continue traversing the directory.
@@ -426,17 +442,19 @@ pub(crate) fn copy_directory(
         }
     }
 
+    // Fix permissions for all directories we created
+    for (src, tgt) in dirs_with_attrs_to_fix {
+        copy_attributes(&src, &tgt, &options.attributes)?;
+    }
+
     // Copy the attributes from the root directory to the target directory.
     if options.parents {
         let dest = target.join(root.file_name().unwrap());
-        copy_attributes(root, dest.as_path(), &options.attributes)?;
         for (x, y) in aligned_ancestors(root, dest.as_path()) {
             if let Ok(src) = canonicalize(x, MissingHandling::Normal, ResolveMode::Physical) {
                 copy_attributes(&src, y, &options.attributes)?;
             }
         }
-    } else {
-        copy_attributes(root, target, &options.attributes)?;
     }
 
     Ok(())
@@ -469,20 +487,31 @@ pub fn path_has_prefix(p1: &Path, p2: &Path) -> io::Result<bool> {
 /// Builds a directory at the specified path with the given options.
 ///
 /// # Notes
-/// - It excludes certain permissions if ownership or special mode bits could
-///   potentially change.
+/// - If `copy_attributes_from` is `Some`, the new directory's attributes will be
+///   copied from the provided file. Otherwise, the new directory will have the default
+///   attributes for the current user.
+/// - This method excludes certain permissions if ownership or special mode bits could
+///   potentially change. (See `test_dir_perm_race_with_preserve_mode_and_ownership``)
 /// - The `recursive` flag determines whether parent directories should be created
 ///   if they do not already exist.
 // we need to allow unused_variable since `options` might be unused in non unix systems
 #[allow(unused_variables)]
-fn build_dir(options: &Options, path: &PathBuf, recursive: bool) -> CopyResult<()> {
+fn build_dir(
+    path: &PathBuf,
+    recursive: bool,
+    options: &Options,
+    copy_attributes_from: Option<&Path>,
+) -> CopyResult<()> {
     let mut builder = fs::DirBuilder::new();
     builder.recursive(recursive);
+
     // To prevent unauthorized access before the folder is ready,
     // exclude certain permissions if ownership or special mode bits
     // could potentially change.
     #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt;
+
         // we need to allow trivial casts here because some systems like linux have u32 constants in
         // in libc while others don't.
         #[allow(clippy::unnecessary_cast)]
@@ -494,10 +523,22 @@ fn build_dir(options: &Options, path: &PathBuf, recursive: bool) -> CopyResult<(
             } else {
                 0
             } as u32;
-        excluded_perms |= uucore::mode::get_umask();
+
+        let umask = if copy_attributes_from.is_some()
+            && matches!(options.attributes.mode, Preserve::Yes { .. })
+        {
+            !fs::symlink_metadata(copy_attributes_from.unwrap())?
+                .permissions()
+                .mode()
+        } else {
+            uucore::mode::get_umask()
+        };
+
+        excluded_perms |= umask;
         let mode = !excluded_perms & 0o777; //use only the last three octet bits
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, mode);
     }
+
     builder.create(path)?;
     Ok(())
 }
