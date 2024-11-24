@@ -3364,6 +3364,38 @@ fn test_copy_dir_preserve_permissions() {
     assert_metadata_eq!(metadata1, metadata2);
 }
 
+/// cp should preserve most permissions of subdirectories when recursively copying a directory,
+/// with exceptions detailed in [`test_dir_perm_race_with_preserve_mode_and_ownership`].
+#[cfg(all(not(windows), not(target_os = "freebsd"), not(target_os = "openbsd")))]
+#[test]
+fn test_copy_dir_preserve_subdir_permissions() {
+    let (at, mut ucmd) = at_and_ucmd!();
+    at.mkdir("a1");
+    at.mkdir("a1/a2");
+    // Use different permissions for a better test
+    at.set_mode("a1/a2", 0o0555);
+    at.set_mode("a1", 0o0777);
+
+    // Copy the directory, preserving those permissions.
+    //
+    //         preserve permissions (mode, ownership, timestamps)
+    //            |    copy directories recursively
+    //            |      |   from this source directory
+    //            |      |    |   to this destination
+    //            |      |    |     |
+    //            V      V    V     V
+    ucmd.args(&["-p", "-r", "a1", "b1"])
+        .succeeds()
+        .no_stderr()
+        .no_stdout();
+
+    // Make sure everything is preserved
+    assert!(at.dir_exists("b1"));
+    assert!(at.dir_exists("b1/a2"));
+    assert_metadata_eq!(at.metadata("a1"), at.metadata("b1"));
+    assert_metadata_eq!(at.metadata("a1/a2"), at.metadata("b1/a2"));
+}
+
 /// Test for preserving permissions when copying a directory, even in
 /// the face of an inaccessible file in that directory.
 #[cfg(all(not(windows), not(target_os = "freebsd"), not(target_os = "openbsd")))]
@@ -5615,7 +5647,7 @@ mod link_deref {
 // which could be problematic if we aim to preserve ownership or mode. For example, when
 // copying a directory, the destination directory could temporarily be setgid on some filesystems.
 // This temporary setgid status could grant access to other users who share the same group
-// ownership as the newly created directory.To mitigate this issue, when creating a directory we
+// ownership as the newly created directory. To mitigate this issue, when creating a directory we
 // disable these excessive permissions.
 #[test]
 #[cfg(unix)]
